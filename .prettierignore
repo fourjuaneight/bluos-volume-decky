@@ -1,0 +1,7 @@
+dist/
+node_modules/
+pnpm-lock.yaml
+*.pdf
+
+# Source spec, not ours to reformat.
+Implementation_Guide.md
