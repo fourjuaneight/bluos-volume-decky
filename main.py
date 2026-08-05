@@ -11,16 +11,22 @@ UTF-8 XML. Only the volume surface is used here:
 Every public coroutine on `Plugin` is callable from the frontend. Failures
 come back as `{"error": "..."}` rather than raising, so nothing throws across
 the Python/TypeScript bridge.
+
+Note on parsing: decky-loader ships as a PyInstaller bundle and plugins run
+inside its frozen interpreter, whose stdlib only contains the modules decky
+itself imports. `xml.etree` is not among them, so responses are picked apart
+with `re` instead. Both shapes this plugin reads are a single flat element,
+which keeps that honest.
 """
 
 import asyncio
 import json
 import os
+import re
 import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
-import xml.etree.ElementTree as ET
 from typing import Any, Dict, List, Optional
 
 import decky
@@ -32,14 +38,71 @@ BUNDLED_DEFAULTS = os.path.join(decky.DECKY_PLUGIN_DIR, "settings.json")
 DEFAULT_PORT = 11000
 REQUEST_TIMEOUT = 5
 
+# Matches the opening tag of the first real element, skipping any <?xml ...?>
+# declaration: a tag name must start with a letter or underscore, so "<?xml"
+# can never match.
+_ELEMENT_RE = re.compile(
+    r"<\s*(?P<tag>[A-Za-z_][\w.:-]*)"
+    r"(?P<attrs>(?:\s+[\w.:-]+\s*=\s*(?:\"[^\"]*\"|'[^']*'))*)"
+    r"\s*(?P<empty>/?)>"
+)
+_ATTR_RE = re.compile(r"(?P<key>[\w.:-]+)\s*=\s*(?:\"(?P<dq>[^\"]*)\"|'(?P<sq>[^']*)')")
+# "&amp;" must be last so an escaped ampersand is not unescaped twice.
+_ENTITIES = (("&lt;", "<"), ("&gt;", ">"), ("&quot;", '"'), ("&apos;", "'"), ("&amp;", "&"))
 
-def _fetch(url: str) -> ET.Element:
-    """Blocking GET returning the parsed XML root. Runs on a worker thread."""
+
+class ParseError(Exception):
+    """A response was not the XML this plugin expects."""
+
+
+def _unescape(value: str) -> str:
+    for entity, char in _ENTITIES:
+        value = value.replace(entity, char)
+    return value
+
+
+class Element:
+    """The slice of ElementTree.Element this plugin actually used."""
+
+    def __init__(self, tag: str, attrs: Dict[str, str], text: str) -> None:
+        self.tag = tag
+        self.attrs = attrs
+        self.text = text
+
+    def get(self, key: str, default: Optional[str] = None) -> Optional[str]:
+        return self.attrs.get(key, default)
+
+
+def _parse(payload: bytes) -> Element:
+    """Pull the root element's attributes and text out of a BluOS response."""
+    document = payload.decode("utf-8", errors="replace")
+    match = _ELEMENT_RE.search(document)
+    if not match:
+        raise ParseError("no XML element in response")
+
+    attrs = {
+        attr.group("key"): _unescape(
+            attr.group("dq") if attr.group("dq") is not None else attr.group("sq")
+        )
+        for attr in _ATTR_RE.finditer(match.group("attrs"))
+    }
+
+    text = ""
+    if not match.group("empty"):
+        end = document.find(f"</{match.group('tag')}", match.end())
+        if end != -1:
+            text = document[match.end() : end]
+
+    return Element(match.group("tag"), attrs, _unescape(text.strip()))
+
+
+def _fetch(url: str) -> Element:
+    """Blocking GET returning the parsed root element. Runs on a worker thread."""
     with urllib.request.urlopen(url, timeout=REQUEST_TIMEOUT) as response:
-        return ET.fromstring(response.read())
+        return _parse(response.read())
 
 
-async def _get(url: str) -> ET.Element:
+async def _get(url: str) -> Element:
     """urllib is blocking; keep it off decky's event loop."""
     return await asyncio.to_thread(_fetch, url)
 
@@ -51,7 +114,7 @@ def _build_url(ip: str, port: int, path: str, params: Optional[Dict[str, Any]] =
     return url
 
 
-def _parse_volume(root: ET.Element) -> Dict[str, Any]:
+def _parse_volume(root: Element) -> Dict[str, Any]:
     """Read a <volume db="-49.9" mute="0" ...>15</volume> response.
 
     A level of -1 means the player runs at a fixed output level and its
@@ -164,7 +227,7 @@ class Plugin:
         except (urllib.error.URLError, OSError) as exc:
             decky.logger.error("add_player %s:%s -> %s", ip, port, exc)
             return {"error": f"Could not reach {ip}:{port}"}
-        except ET.ParseError:
+        except ParseError:
             decky.logger.error("add_player %s:%s -> malformed XML", ip, port)
             return {"error": f"{ip} is not a BluOS player"}
 
@@ -209,7 +272,7 @@ class Plugin:
         except (urllib.error.URLError, OSError) as exc:
             decky.logger.error("%s %s:%s -> %s", action, ip, port, exc)
             return {"error": f"Could not reach {ip}:{port}"}
-        except ET.ParseError:
+        except ParseError:
             decky.logger.error("%s %s:%s -> malformed XML", action, ip, port)
             return {"error": f"{ip} returned an unreadable response"}
         return _parse_volume(root)
