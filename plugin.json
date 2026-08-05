@@ -1,0 +1,11 @@
+{
+  "name": "BluOS Volume",
+  "author": "fourjuaneight",
+  "flags": [],
+  "api_version": 1,
+  "publish": {
+    "tags": ["audio", "volume", "bluos", "bluesound"],
+    "description": "Control BluOS player volume from Quick Access Menu.",
+    "image": ""
+  }
+}
