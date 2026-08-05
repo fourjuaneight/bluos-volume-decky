@@ -73,10 +73,31 @@ Backend methods return either their payload or `{"error": "..."}` — nothing
 raises across the Python/TypeScript bridge, and the frontend surfaces failures
 as a toast.
 
-The backend uses the standard library only (`urllib`, `xml.etree`), so there
-are no pip dependencies to vendor. Requests are dispatched with
-`asyncio.to_thread` because `urllib` is blocking and would otherwise stall
-decky's event loop.
+The backend uses the standard library only, so there are no pip dependencies to
+vendor. Requests are dispatched with `asyncio.to_thread` because `urllib` is
+blocking and would otherwise stall decky's event loop.
+
+### Why there is a hand-rolled XML parser
+
+decky-loader ships as a PyInstaller bundle, and plugins run inside its frozen
+interpreter. That interpreter only contains the stdlib modules PyInstaller found
+in decky's own source, which is a subset of a normal Python install. `xml.etree`
+is not in it:
+
+```
+File "/home/deck/homebrew/plugins/decky-bluos-volume/main.py", line 23, in <module>
+    import xml.etree.ElementTree as ET
+ModuleNotFoundError: No module named 'xml.etree'
+```
+
+So `main.py` picks responses apart with `re` instead. Both shapes it reads are a
+single flat element — `<volume …>15</volume>` and `<SyncStatus name="…" …>` —
+so a regex is sufficient rather than merely expedient. `_parse()` returns a
+small `Element` with the `.get()` and `.text` surface the rest of the file uses.
+
+**Adding an import to `main.py` is not free.** `asyncio`, `json`, `os`, `re`,
+`tempfile` and `urllib` are confirmed present. Anything else may be missing from
+the frozen runtime and will only fail once loaded on the Deck.
 
 ## Interaction details
 
@@ -164,35 +185,57 @@ plugin.json          manifest decky reads to register the plugin
 main.py              backend
 package.json         name and version
 dist/index.js        bundled frontend, produced by `pnpm run build`
-defaults/            seed settings, copied into the plugin dir on first load
+dist/index.js.map    sourcemap, so Deck-side stack traces point at src/
+defaults/            seed settings
 ```
 
 ### One-time Deck setup
 
-1. Desktop Mode → **Settings → Users** (or a terminal) → set a password for the
-   `deck` user with `passwd`. SteamOS ships without one and `sudo` will not work
-   until it is set.
+1. Desktop Mode → **Settings → Users** (or a terminal) → set a password for your
+   user with `passwd`. SteamOS ships without one and `sudo` will not work until
+   it is set.
 2. **System Settings → Developer → Enable SSH**, or start it manually with
    `sudo systemctl start sshd`.
 3. Find the Deck's IP under **Settings → Internet**.
 
-### Copy and install
+### Installing
 
-Build first, then copy from your workstation:
+`dist/` is gitignored, so it only exists where the build ran. Build on a
+workstation, then get the repo onto the Deck with `dist/` included:
 
 ```sh
 pnpm install
 pnpm run build
 
-rsync -av --relative \
-  plugin.json main.py package.json dist/index.js defaults/ \
-  deck@<DECK_IP>:~/homebrew/plugins/decky-bluos-volume/
+rsync -av --exclude node_modules --exclude .git . deck@<DECK_IP>:~/bluos-volume-decky/
 ```
 
-Then, on the Deck, hand the directory to root and restart the loader. Decky runs
-as root and ignores plugin directories it does not own:
+Then, on the Deck, from the repo:
 
 ```sh
+./install.sh
+```
+
+[`install.sh`](install.sh) copies the runtime files into
+`~/homebrew/plugins/decky-bluos-volume`, hands the directory to `root:root`
+(decky runs as root and ignores directories it does not own), and restarts
+`plugin_loader`. Re-run it after every change — that is the whole update
+procedure.
+
+It **replaces** the plugin directory rather than copying over the top, so a file
+deleted from the repo cannot linger on the Deck. Settings are stored in decky's
+own settings directory, not in the plugin directory, so they survive a
+reinstall.
+
+It refuses to do anything if `~/homebrew/plugins` is missing or if any runtime
+file is absent, and calls out the gitignored-`dist/` case by name, since that is
+the one that produces a blank panel rather than an obvious error.
+
+If you would rather do it by hand:
+
+```sh
+sudo cp -r plugin.json main.py package.json dist defaults \
+  ~/homebrew/plugins/decky-bluos-volume/
 sudo chown -R root:root ~/homebrew/plugins/decky-bluos-volume
 sudo chmod -R 755 ~/homebrew/plugins/decky-bluos-volume
 sudo systemctl restart plugin_loader
@@ -203,19 +246,9 @@ Decky icon. **BluOS Volume** should be in the list.
 
 ### Updating
 
-Same sequence every time. The `chown` has to be repeated, because rsync writes
-the new files as `deck`:
-
-```sh
-pnpm run build
-rsync -av --relative \
-  plugin.json main.py package.json dist/index.js defaults/ \
-  deck@<DECK_IP>:~/homebrew/plugins/decky-bluos-volume/
-ssh deck@<DECK_IP> '
-  sudo chown -R root:root ~/homebrew/plugins/decky-bluos-volume &&
-  sudo systemctl restart plugin_loader
-'
-```
+Rebuild, sync the repo across, run `./install.sh` again. The `chown` matters
+every time, not just on first install, because a fresh copy lands owned by your
+user — the script handles it.
 
 Frontend-only changes can be picked up by reloading the plugin from Decky's
 settings instead of restarting the service. Backend changes to `main.py` always
